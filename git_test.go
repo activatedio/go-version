@@ -25,6 +25,12 @@ func newRepo(t *testing.T) *repo {
 	t.Helper()
 	r := &repo{t: t, dir: t.TempDir()}
 	r.git("init", "-q", "-b", "main")
+	// Repo-local identity: the env vars on r.git only cover the helper's own
+	// git calls, but Tag/Push under test run git themselves and inherit the
+	// bare process environment — which on a CI runner has no identity at all
+	// ("fatal: empty ident name"). Local config makes the repo self-contained.
+	r.git("config", "user.name", "test")
+	r.git("config", "user.email", "test@activated.io")
 	return r
 }
 
