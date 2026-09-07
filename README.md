@@ -124,6 +124,39 @@ publish:
 **Prod pins an immutable `:X.Y.Z`. Dev may track `:main-latest`. Nothing
 prod-facing ever uses a moving tag.**
 
+### The bare `:X.Y.Z` must be derived from the trigger, not from the version
+
+This table is a contract, and keeping it takes one deliberate step, because
+**`VERSION` alone cannot tell you which row you are in.**
+
+`VERSION` is sha-suffixed only *between* releases. On the commit that a release
+tag points at it is the clean `X.Y.Z` — and it is clean on **every** ref that
+reaches that commit, because it is computed from git and knows nothing about the
+pipeline it runs in. Releasing means pushing the mainline and then the tag, so
+two pipelines run on that commit seconds apart and **both compute `X.Y.Z`**.
+
+Publish `:${VERSION}` unconditionally and the mainline pipeline therefore
+publishes the release's own artifact tag, in violation of the first row. Whichever
+finishes last wins, and container builds are not bit-reproducible, so the digest
+changes with it: the tag still resolves, but no longer to what the release
+published. A digest recorded against that tag — in release notes, in an
+attestation, in a downstream pin derived by reading the tag — silently stops
+matching.
+
+So derive the artifact tag from the trigger. Both recipes below do, and the
+sha-suffix is applied by stripping any sha `go-version` already added and
+re-appending the CI one (`${VERSION%%-*}-${SHORT_SHA}`), so a mainline artifact
+has one shape whether or not the commit happens to be tagged.
+
+**This is not container-specific.** Anything keyed by version has the same
+collision: a generic package registry path, an npm version, a Maven coordinate.
+The Java convention already handles it by construction — the mainline job
+publishes `${VERSION}-SNAPSHOT` and only the release job publishes `${VERSION}` —
+and that is the same fix in different clothing. Registries that refuse to
+overwrite an existing version (npm, Maven Central) turn the collision into a
+failed job rather than a silent replacement, which is better but still a broken
+release pipeline.
+
 ## GitLab CI
 
 The computation needs full history and tags. GitLab clones shallow by
@@ -164,8 +197,21 @@ publish:
   stage: publish
   script:
     # ${VERSION} arrives via the dotenv artifact.
-    - if [ -n "${CI_COMMIT_TAG}" ]; then MOVING_TAG="latest"; else MOVING_TAG="${CI_COMMIT_REF_SLUG}-latest"; fi
-    - make publish VERSION="${VERSION}" DOCKER_TAG="${VERSION}"
+    # Both tags come from CI_COMMIT_TAG, and both must: see "The bare :X.Y.Z
+    # must be derived from the trigger". ARTIFACT_TAG is NOT ${VERSION} —
+    # ${VERSION} is clean on a tagged commit whichever ref is building it, so
+    # using it here lets a mainline pipeline overwrite the release's own tag.
+    - |
+      if [ -n "${CI_COMMIT_TAG}" ]; then
+        ARTIFACT_TAG="${VERSION}"
+        MOVING_TAG="latest"
+      else
+        ARTIFACT_TAG="${VERSION%%-*}-${CI_COMMIT_SHORT_SHA}"
+        MOVING_TAG="${CI_COMMIT_REF_SLUG}-latest"
+      fi
+    # VERSION stays the git-derived value: that is what gets stamped into the
+    # binary, and it should describe the code. ARTIFACT_TAG names the artifact.
+    - make publish VERSION="${VERSION}" DOCKER_TAG="${ARTIFACT_TAG}"
     - make publish VERSION="${VERSION}" DOCKER_TAG="${MOVING_TAG}"
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
@@ -173,8 +219,13 @@ publish:
 ```
 
 (Adapt the publish job to your artifact pipeline — multi-arch image builds
-typically push `:${VERSION}-<arch>` per arch job, then a manifest job merges
-them into `:${VERSION}` and `:${MOVING_TAG}`.)
+typically push a per-arch staging tag, then a manifest job merges the pair into
+`:${ARTIFACT_TAG}` and `:${MOVING_TAG}`. **Scope the staging tags to the
+pipeline, not to the version** — `stage-${CI_PIPELINE_ID}-<arch>`, say. Two
+pipelines on one commit compute the same `VERSION`, so version-named staging
+tags are a shared mutable resource: the first job to finish deletes the inputs
+the second still needs, and the release fails with a 404 on a tag the other
+pipeline already cleaned up.)
 
 ## GitHub Actions
 
@@ -214,9 +265,18 @@ jobs:
       - name: Publish
         if: github.event_name == 'push'
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then MOVING_TAG="latest"; else MOVING_TAG="${GITHUB_REF_NAME}-latest"; fi
-          make publish VERSION="${{ steps.version.outputs.version }}" DOCKER_TAG="${{ steps.version.outputs.version }}"
-          make publish VERSION="${{ steps.version.outputs.version }}" DOCKER_TAG="${MOVING_TAG}"
+          VERSION="${{ steps.version.outputs.version }}"
+          # Derived from the trigger, not from VERSION — see "The bare :X.Y.Z
+          # must be derived from the trigger".
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            ARTIFACT_TAG="${VERSION}"
+            MOVING_TAG="latest"
+          else
+            ARTIFACT_TAG="${VERSION%%-*}-${GITHUB_SHA::8}"
+            MOVING_TAG="${GITHUB_REF_NAME}-latest"
+          fi
+          make publish VERSION="${VERSION}" DOCKER_TAG="${ARTIFACT_TAG}"
+          make publish VERSION="${VERSION}" DOCKER_TAG="${MOVING_TAG}"
 ```
 
 ## How do I cut a release?
