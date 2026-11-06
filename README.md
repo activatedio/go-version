@@ -133,12 +133,22 @@ publish:
 
 | Trigger | Artifact tags |
 |---|---|
-| Commit to the **publishing branch** of a codeline (the default branch, or a `release-*` branch) | `:<X.Y.Z-sha8>` (immutable) **and** `:<ref>-latest` (moving, e.g. `main-latest`) |
-| Annotated tag `vX.Y.Z` | `:<X.Y.Z>` (immutable) **and** `:latest` (moving) |
+| Commit to the **publishing branch** of a codeline (the default branch, or a `release-*` branch) | `:<X.Y.Z-sha8>` (immutable) |
+| Annotated tag `vX.Y.Z` | `:<X.Y.Z>` (immutable) |
 | Other feature branch / MR / PR | none — the pipeline only runs tests + lint |
 
-**Prod pins an immutable `:X.Y.Z`. Dev may track `:main-latest`. Nothing
-prod-facing ever uses a moving tag.**
+**Every artifact tag is immutable. No moving tag is published — not
+`:latest`, not `:<ref>-latest`.** A moving tag is a cached answer to a
+question that changes ("what is newest?"), and it lies in two ways: a
+branch's `-latest` trails a release, so whatever tracks it runs old code and
+reports no error; and a moving tag and the release tag it shadows resolve to
+*different digests* of the same commit, because image builds are not
+bit-reproducible, so any digest recorded against one silently stops matching
+the other. "What is newest" is a query — the registry's tag list, the
+releases API — and a deployment pins `:X.Y.Z`. (`:latest` earns its own
+rule: a reference with no tag resolves to it, so an untagged reference to
+your own registry is a moving tag too. A CI gate that greps for both is
+cheap; the Activated templates carry one as `hack/check-moving-tags.sh`.)
 
 ### Exactly one branch per codeline publishes
 
@@ -267,30 +277,43 @@ publish:
   stage: publish
   script:
     # ${VERSION} arrives via the dotenv artifact.
-    # Both tags come from CI_COMMIT_TAG, and both must: see "The bare :X.Y.Z
-    # must be derived from the trigger". ARTIFACT_TAG is NOT ${VERSION} —
+    # The tag comes from CI_COMMIT_TAG, and must: see "The bare :X.Y.Z must
+    # be derived from the trigger". ARTIFACT_TAG is NOT ${VERSION} —
     # ${VERSION} is clean on a tagged commit whichever ref is building it, so
     # using it here lets a mainline pipeline overwrite the release's own tag.
     - |
       if [ -n "${CI_COMMIT_TAG}" ]; then
         ARTIFACT_TAG="${VERSION}"
-        MOVING_TAG="latest"
       else
         ARTIFACT_TAG="${VERSION%%-*}-${CI_COMMIT_SHORT_SHA}"
-        MOVING_TAG="${CI_COMMIT_REF_SLUG}-latest"
       fi
     # VERSION stays the git-derived value: that is what gets stamped into the
     # binary, and it should describe the code. ARTIFACT_TAG names the artifact.
     - make publish VERSION="${VERSION}" DOCKER_TAG="${ARTIFACT_TAG}"
-    - make publish VERSION="${VERSION}" DOCKER_TAG="${MOVING_TAG}"
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_BRANCH =~ /^release-/'
+
+# The release object, from the CHANGELOG section of the tag (see "How do I
+# cut a release?"). No `needs:`, so it waits for every publish. The version
+# job runs the same extraction on tag pipelines (`> /dev/null`), so a tag
+# with no section fails before anything publishes.
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:v0.24.0
+  script:
+    - hack/release-notes.sh "${CI_COMMIT_TAG}" > release-notes.md
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: $CI_COMMIT_TAG
+    description: ./release-notes.md
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
 ```
 
 (Adapt the publish job to your artifact pipeline — multi-arch image builds
 typically push a per-arch staging tag, then a manifest job merges the pair into
-`:${ARTIFACT_TAG}` and `:${MOVING_TAG}`. **Scope the staging tags to the
+`:${ARTIFACT_TAG}`. **Scope the staging tags to the
 pipeline, not to the version** — `stage-${CI_PIPELINE_ID}-<arch>`, say. Two
 pipelines on one commit compute the same `VERSION`, so version-named staging
 tags are a shared mutable resource: the first job to finish deletes the inputs
@@ -340,13 +363,10 @@ jobs:
           # must be derived from the trigger".
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             ARTIFACT_TAG="${VERSION}"
-            MOVING_TAG="latest"
           else
             ARTIFACT_TAG="${VERSION%%-*}-${GITHUB_SHA::8}"
-            MOVING_TAG="${GITHUB_REF_NAME}-latest"
           fi
           make publish VERSION="${VERSION}" DOCKER_TAG="${ARTIFACT_TAG}"
-          make publish VERSION="${VERSION}" DOCKER_TAG="${MOVING_TAG}"
 ```
 
 ## How do I cut a release?
@@ -359,8 +379,22 @@ Two things come before the tag, both in the same push:
 2. **Create the release object for the tag** (a GitLab or GitHub release)
    **with that section as its description.** The changelog entry and the
    release notes are one text, written once; pointing the release at it is
-   what keeps them from drifting. A pipeline can create the release from the
-   changelog section on the tag build.
+   what keeps them from drifting. Let the tag pipeline do it (the `release`
+   job above), and let the same pipeline refuse a tag whose section is
+   missing before anything publishes.
+
+Name the section for the tag — `## v1.6.0`, optionally followed by a date
+(`## v1.6.0 — 2026-11-06`) — and keep an `## Unreleased` section above it
+that becomes the next one. The extraction is a few lines of POSIX shell
+(the Activated templates carry it as `hack/release-notes.sh`):
+
+```sh
+# print the body under "## vX.Y.Z" up to the next "## "; fail if empty
+v="${1#v}"
+notes=$(awk -v v="$v" '/^## /{ if (f) exit; h=$0; sub(/^## +v?/,"",h); split(h,w,/[ \t]/); if (w[1]==v) { f=1; next } } f' CHANGELOG.md)
+[ -n "$(printf '%s' "$notes" | tr -d '[:space:]')" ] || { echo "no CHANGELOG section for v$v" >&2; exit 1; }
+printf '%s\n' "$notes"
+```
 
 Then tag. Either by hand:
 
