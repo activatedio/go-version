@@ -66,6 +66,22 @@ go tool go-version bump -dry-run       # preview
 go tool go-version bump -push          # tag + push = release
 ```
 
+### Projects that are not Go
+
+The computation is a property of the git history, not of the language. A
+repo with no `go.mod` (a frontend, an infrastructure repo, a Java project
+that is not on jgitver) runs the CLI from a Go image without adding a
+dependency:
+
+```bash
+go run github.com/activatedio/go-version/cmd/go-version@v0.1.1
+```
+
+Pin the version, as above. Stamp the artifact the way the Dockerfile recipe
+below does: pass `VERSION` in as a build argument and write it wherever the
+artifact reports its version (`package.json` at build time, a `version.txt`,
+an image label). Nothing is committed.
+
 ## Make
 
 The standard Makefile block:
@@ -117,12 +133,32 @@ publish:
 
 | Trigger | Artifact tags |
 |---|---|
-| Commit to the mainline or a `release-*` branch | `:<X.Y.Z-sha8>` (immutable) **and** `:<ref>-latest` (moving, e.g. `main-latest`) |
+| Commit to the **publishing branch** of a codeline (the default branch, or a `release-*` branch) | `:<X.Y.Z-sha8>` (immutable) **and** `:<ref>-latest` (moving, e.g. `main-latest`) |
 | Annotated tag `vX.Y.Z` | `:<X.Y.Z>` (immutable) **and** `:latest` (moving) |
 | Other feature branch / MR / PR | none — the pipeline only runs tests + lint |
 
 **Prod pins an immutable `:X.Y.Z`. Dev may track `:main-latest`. Nothing
 prod-facing ever uses a moving tag.**
+
+### Exactly one branch per codeline publishes
+
+A flow with an integration branch (`develop` → `main`, say) must publish from
+**one** of them, and that one is the branch the releases are cut from: the
+default branch for the mainline, `release-X.Y` for a maintenance line. The
+integration branch is built and tested, and publishes nothing.
+
+The reason is the same collision as the next section, on a second axis. The
+mainline artifact tag `<X.Y.Z-sha8>` names the *commit*, not the *ref*. A
+release merge makes `develop` and `main` point at the same commit, both
+pipelines compute the same tag, and whichever finishes last silently
+replaces the other's artifact. Deriving the tag from the trigger does not
+help here, because both triggers are branches. The only fix is that only one
+of them publishes.
+
+So the publish rules in the recipes below name the default branch and
+`release-*`, and never the integration branch. Say which branch publishes in
+your repo's README as well: contributors act on it, and it is invisible from
+the CI file unless they go looking.
 
 ### The bare `:X.Y.Z` must be derived from the trigger, not from the version
 
@@ -156,6 +192,40 @@ and that is the same fix in different clothing. Registries that refuse to
 overwrite an existing version (npm, Maven Central) turn the collision into a
 failed job rather than a silent replacement, which is better but still a broken
 release pipeline.
+
+#### The stand-down variant
+
+Where the artifact namespace is flat and every published version costs
+something (npm, a package registry that lists each version), a second
+pattern is acceptable: the version job notes that a **clean** version on a
+**branch** pipeline means exactly one thing, that HEAD carries the release
+tag, and the publish job stands down because the tag pipeline owns that
+commit.
+
+```yaml
+# in the version job, after computing VERSION
+- |
+  TAG_PIPELINE_OWNS=false
+  if [ -z "${CI_COMMIT_TAG}" ]; then
+    case "${VERSION}" in
+      *-*) ;;                       # sha-suffixed: an ordinary branch build
+      *) TAG_PIPELINE_OWNS=true ;;  # clean: HEAD is the release commit
+    esac
+  fi
+  { echo "VERSION=${VERSION}"; echo "TAG_PIPELINE_OWNS=${TAG_PIPELINE_OWNS}"; } | tee version.env
+
+# in the publish job
+- |
+  if [ "${TAG_PIPELINE_OWNS}" = "true" ]; then
+    echo "${CI_COMMIT_SHORT_SHA} is the release commit for v${VERSION}; the tag pipeline builds it. Standing down."
+    exit 0
+  fi
+```
+
+It is the weaker choice everywhere else, because it drops the mainline
+artifact for that commit instead of naming it correctly, and the promise of
+an installable artifact for every mainline commit is worth keeping. Prefer
+the trigger-derived tag; take the variant only with a reason.
 
 ## GitLab CI
 
@@ -281,7 +351,18 @@ jobs:
 
 ## How do I cut a release?
 
-Either tag by hand:
+Two things come before the tag, both in the same push:
+
+1. **Write the version's section in `CHANGELOG.md`.** Upgrade notes first:
+   what an operator has to do, or can now stop doing. Then what is new. It is
+   written for someone deciding whether to upgrade and what it will cost.
+2. **Create the release object for the tag** (a GitLab or GitHub release)
+   **with that section as its description.** The changelog entry and the
+   release notes are one text, written once; pointing the release at it is
+   what keeps them from drifting. A pipeline can create the release from the
+   changelog section on the tag build.
+
+Then tag. Either by hand:
 
 ```bash
 git tag -a v1.6.0 -m "Release v1.6.0"
